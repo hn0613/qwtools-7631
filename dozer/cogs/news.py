@@ -54,6 +54,7 @@ class News(Cog):
 
             logger.debug(f"Getting source {source.full_name}")
             subs = await NewsSubscription.get_by(source=source.short_name)
+            subs = [sub for sub in subs if not sub.disabled]
 
             if not subs:
                 logger.debug(f"Skipping source {source.full_name} due to no subscriptions")
@@ -131,7 +132,7 @@ class News(Cog):
                 self.sources[source.short_name] = source(aiohttp_session=self.http_source, bot=self.bot)
                 if issubclass(source, DataBasedSource):
                     subs = await NewsSubscription.get_by(source=source.short_name)
-                    data = {sub.data for sub in subs}
+                    data = {sub.data for sub in subs if not sub.disabled}
                     await self.sources[source.short_name].first_run(data)
                 else:
                     await self.sources[source.short_name].first_run()
@@ -164,6 +165,10 @@ class News(Cog):
                               f"embed frc`")
         embed.add_field(name="Removing Subscriptions",
                         value=f"To remove a source, like Chief Delphi, use `{ctx.prefix}news remove #channel cd`")
+        embed.add_field(name="Pausing Subscriptions",
+                        value=f"To temporarily stop a subscription without removing it, use "
+                              f"`{ctx.prefix}news pause #channel cd`. To resume, use "
+                              f"`{ctx.prefix}news resume #channel cd`")
         embed.add_field(name="List all sources",
                         value=f"To see all sources, use `{ctx.prefix}news sources`")
         embed.add_field(name="List all subscriptions",
@@ -216,6 +221,23 @@ class News(Cog):
                                                           data=str(data_obj))
 
             if search_exists:
+                if search_exists[0].disabled:
+                    # Reactivate the paused subscription
+                    search_exists[0].disabled = False
+                    await search_exists[0].update_or_add()
+                    # Re-add data to in-memory source if this is the first active sub for this data
+                    active_subs = [s for s in await NewsSubscription.get_by(source=source.short_name,
+                                                                            data=str(data_obj))
+                                   if not s.disabled]
+                    if len(active_subs) == 1:
+                        await source.add_data(data_obj)
+                    embed = discord.Embed(title=f"Channel #{channel.name} re-subscribed to {source.full_name}",
+                                          description="This subscription was paused and has been reactivated.")
+                    embed.add_field(name="Kind", value=search_exists[0].kind)
+                    embed.add_field(name="Data", value=data_obj.full_name)
+                    embed.colour = discord.Color.green()
+                    await ctx.send(embed=embed)
+                    return
                 raise BadArgument(f"There is already a subscription of {source.full_name} with data {data} "
                                   f"in {channel.mention}")
 
@@ -232,6 +254,16 @@ class News(Cog):
             search_exists = await NewsSubscription.get_by(channel_id=channel.id, source=source.short_name)
 
             if search_exists:
+                if search_exists[0].disabled:
+                    # Reactivate the paused subscription
+                    search_exists[0].disabled = False
+                    await search_exists[0].update_or_add()
+                    embed = discord.Embed(title=f"Channel #{channel.name} re-subscribed to {source.full_name}",
+                                          description="This subscription was paused and has been reactivated.")
+                    embed.add_field(name="Kind", value=search_exists[0].kind)
+                    embed.colour = discord.Color.green()
+                    await ctx.send(embed=embed)
+                    return
                 if search_exists[0].kind == kind:
                     raise BadArgument(f"There is already a subscription of {source.full_name} for {channel.mention}.")
                 else:
@@ -324,6 +356,128 @@ class News(Cog):
     remove.example_usage = """`{prefix}news remove #news cd` - Remove the subscription of Chief Delphi to #news
      `{prefix}news remove #reddit reddit frc` - Remove the subscription of /r/FRC to #reddit"""
 
+    @news.command()
+    @has_permissions(manage_guild=True)
+    @guild_only()
+    async def pause(self, ctx: DozerContext, channel: discord.TextChannel, source: Source, data=None):
+        """Temporarily pause a subscription so it stops posting without removing the configuration."""
+        if isinstance(source, DataBasedSource):
+            if data is None:
+                raise BadArgument(f"The source {source.full_name} needs data.")
+
+            try:
+                data_obj = await source.clean_data(data)
+            except DataBasedSource.InvalidDataException as e:
+                await ctx.send(f"Data {data} is invalid. {e.args[0]}")
+                return
+
+            sub = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                source=source.short_name, data=str(data_obj))
+        else:
+            sub = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                source=source.short_name)
+
+        if not sub:
+            raise BadArgument(f"No subscription of {source.full_name} for channel {channel.mention} found.")
+
+        if len(sub) > 1:
+            if isinstance(source, DataBasedSource):
+                raise BadArgument("There were multiple subscriptions found. Try again with a data parameter.")
+            else:
+                raise BadArgument(f"More than one subscription of {source.full_name} for channel "
+                                  f"{channel.mention} was found. Please contact the Dozer administrators for help.")
+
+        sub = sub[0]
+
+        if sub.disabled:
+            await ctx.send(f"The subscription of {source.full_name} in {channel.mention} is already paused.")
+            return
+
+        sub.disabled = True
+        await sub.update_or_add()
+
+        # For DataBasedSource: if this is the last active sub for this data point, remove from in-memory source
+        if isinstance(source, DataBasedSource):
+            remaining = [s for s in await NewsSubscription.get_by(source=source.short_name, data=str(data_obj))
+                         if not s.disabled]
+            if not remaining:
+                removed = await source.remove_data(data_obj)
+                if not removed:
+                    logger.error(f"Failed to remove data {data_obj} from source {source.full_name} during pause")
+
+        embed = discord.Embed(title=f"Subscription of {channel.mention} to {source.full_name} paused",
+                              description="Posts will no longer be sent until this subscription is resumed. "
+                                          "Use `news resume` to reactivate.")
+        if isinstance(source, DataBasedSource):
+            embed.add_field(name="Data", value=sub.data)
+        embed.colour = discord.Color.orange()
+
+        await ctx.send(embed=embed)
+
+    pause.example_usage = """`{prefix}news pause #news cd` - Pause the Chief Delphi subscription in #news
+    `{prefix}news pause #reddit reddit frc` - Pause the /r/FRC subscription in #reddit"""
+
+    @news.command()
+    @has_permissions(manage_guild=True)
+    @guild_only()
+    async def resume(self, ctx: DozerContext, channel: discord.TextChannel, source: Source, data=None):
+        """Resume a previously paused subscription so it starts posting again."""
+        if isinstance(source, DataBasedSource):
+            if data is None:
+                raise BadArgument(f"The source {source.full_name} needs data.")
+
+            try:
+                data_obj = await source.clean_data(data)
+            except DataBasedSource.InvalidDataException as e:
+                await ctx.send(f"Data {data} is invalid. {e.args[0]}")
+                return
+
+            sub = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                source=source.short_name, data=str(data_obj))
+        else:
+            sub = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                source=source.short_name)
+
+        if not sub:
+            raise BadArgument(f"No subscription of {source.full_name} for channel {channel.mention} found.")
+
+        if len(sub) > 1:
+            if isinstance(source, DataBasedSource):
+                raise BadArgument("There were multiple subscriptions found. Try again with a data parameter.")
+            else:
+                raise BadArgument(f"More than one subscription of {source.full_name} for channel "
+                                  f"{channel.mention} was found. Please contact the Dozer administrators for help.")
+
+        sub = sub[0]
+
+        if not sub.disabled:
+            await ctx.send(f"The subscription of {source.full_name} in {channel.mention} is not paused.")
+            return
+
+        sub.disabled = False
+        await sub.update_or_add()
+
+        # For DataBasedSource: if no other active sub existed for this data point, re-add to in-memory source
+        if isinstance(source, DataBasedSource):
+            active_subs = [s for s in await NewsSubscription.get_by(source=source.short_name, data=str(data_obj))
+                           if not s.disabled]
+            if len(active_subs) == 1:
+                # This is the only active sub, so the data point was removed from the source during pause
+                added = await source.add_data(data_obj)
+                if not added:
+                    logger.error(f"Failed to re-add data {data_obj} to source {source.full_name} during resume")
+
+        embed = discord.Embed(title=f"Subscription of {channel.mention} to {source.full_name} resumed",
+                              description="Posts from this source will start appearing again.")
+        if isinstance(source, DataBasedSource):
+            embed.add_field(name="Data", value=sub.data)
+        embed.colour = discord.Color.green()
+
+        await ctx.send(embed=embed)
+
+    resume.example_usage = """`{prefix}news resume #news cd` - Resume the paused Chief Delphi subscription in #news
+    `{prefix}news resume #reddit reddit frc` - Resume the paused /r/FRC subscription in #reddit"""
+
     @news.command(name='sources')
     async def list_sources(self, ctx: DozerContext):
         """List all available sources to subscribe to."""
@@ -380,6 +534,8 @@ class News(Cog):
                 subs += f"{sub.source}"
                 if sub.data:
                     subs += f": {sub.data}"
+                if sub.disabled:
+                    subs += " **[Paused]**"
                 subs += "\n"
             embed.add_field(name=f"#{found_channel.name}", value=subs)
         await ctx.send(embed=embed)
@@ -457,7 +613,18 @@ class NewsSubscription(db.DatabaseTable):
             kind varchar NOT NULL
             )""")
 
-    def __init__(self, channel_id: int, guild_id: int, source: str, kind: str, data: str = None, sub_id: int = None):
+    @classmethod
+    async def migrate_v1_add_disabled(cls):
+        """Add the disabled column to track paused subscriptions"""
+        async with db.Pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE news_subs ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false"
+            )
+
+    __versions__ = [migrate_v1_add_disabled]
+
+    def __init__(self, channel_id: int, guild_id: int, source: str, kind: str,
+                 data: str = None, sub_id: int = None, disabled: bool = False):
         super().__init__()
         self.id = sub_id
         self.channel_id = channel_id
@@ -465,6 +632,7 @@ class NewsSubscription(db.DatabaseTable):
         self.source = source
         self.kind = kind
         self.data = data
+        self.disabled = disabled
 
     @classmethod
     async def get_by(cls, **kwargs):
@@ -473,6 +641,7 @@ class NewsSubscription(db.DatabaseTable):
         for result in results:
             obj = NewsSubscription(sub_id=result.get("id"), channel_id=result.get("channel_id"),
                                    guild_id=result.get("guild_id"), source=result.get("source"),
-                                   kind=result.get("kind"), data=result.get("data"))
+                                   kind=result.get("kind"), data=result.get("data"),
+                                   disabled=result.get("disabled", False))
             result_list.append(obj)
         return result_list
