@@ -71,6 +71,20 @@ class DatabaseTable:
     def nullify():
         """Function to be referenced when a table entry value needs to be set to null"""
 
+    @property
+    def _uniques_list(self):
+        """Normalize __uniques__ to a list of column names, supporting both list and string formats."""
+        if isinstance(self.__uniques__, list):
+            return self.__uniques__
+        return [col.strip() for col in self.__uniques__.split(',')]
+
+    @property
+    def _uniques_sql(self):
+        """Return the __uniques__ clause formatted for SQL ON CONFLICT."""
+        if isinstance(self.__uniques__, list):
+            return ', '.join(self.__uniques__)
+        return self.__uniques__
+
     async def update_or_add(self):
         """Assign the attribute to this object, then call this method to either insert the object if it doesn't exist in
         the DB or update it if it does exist. It will update every column not specified in __uniques__."""
@@ -85,9 +99,11 @@ class DatabaseTable:
                 keys.append(var)
                 values.append(value)
 
+        uniques_list = self._uniques_list
+        uniques_sql = self._uniques_sql
         updates = ""
         for key in keys:
-            if key in self.__uniques__:
+            if key in uniques_list:
                 # Skip updating anything that has a unique constraint on it
                 continue
             updates += f"{key} = EXCLUDED.{key}"
@@ -100,14 +116,14 @@ class DatabaseTable:
                 statement = f"""
                 INSERT INTO {self.__tablename__} ({", ".join(keys)})
                 VALUES({','.join(f'${i + 1}' for i in range(len(values)))})
-                ON CONFLICT ({self.__uniques__}) DO UPDATE
+                ON CONFLICT ({uniques_sql}) DO UPDATE
                 SET {updates}
                 """
             else:
                 statement = f"""
                 INSERT INTO {self.__tablename__} ({", ".join(keys)})
                 VALUES({','.join(f'${i + 1}' for i in range(len(values)))})
-                ON CONFLICT ({self.__uniques__}) DO NOTHING;
+                ON CONFLICT ({uniques_sql}) DO NOTHING;
                 """
             await conn.execute(statement, *values)
 
