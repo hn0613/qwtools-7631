@@ -1,5 +1,7 @@
 """Adds simple text-shortcuts to the bot"""
 
+import re
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import BadArgument, guild_only, has_permissions
@@ -9,14 +11,28 @@ from ._utils import *
 from .. import db
 from ..db import *
 
+# Pattern matching @everyone, @here, <@userid>, <@!userid>, <@&roleid>
+_MENTION_RE = re.compile(r'<@[!&]?\d+>')
+
 class Shortcuts(Cog):
     """Adds simple text-shortcuts to the bot"""
     MAX_LEN = 20
+    MAX_EXTRA_LEN = 500
     def __init__(self, bot):
         """cog init"""
         super().__init__(bot)
         self.settings_cache = db.ConfigCache(ShortcutSetting)
         self.cache = db.ConfigCache(ShortcutEntry)
+
+    @staticmethod
+    def _sanitize_extra(text):
+        """Sanitize user-supplied dynamic content to prevent mention abuse and spam."""
+        text = text[:Shortcuts.MAX_EXTRA_LEN]
+        # Escape @everyone and @here by inserting a zero-width space after @
+        text = text.replace('@everyone', '@\u200beveryone').replace('@here', '@\u200bhere')
+        # Strip user/role mention markup
+        text = _MENTION_RE.sub('', text)
+        return text.strip()
 
     """Commands for managing shortcuts/macros."""
     @guild_only()
@@ -80,6 +96,7 @@ class Shortcuts(Cog):
 
     set.example_usage = """
     `{prefix}shortcuts set hello Hello, World!!!!` - set !hello for the server
+    Shortcuts support dynamic content: `!hello check out this link` will send the template followed by the extra text.
     """
 
     @guild_only()
@@ -119,13 +136,18 @@ class Shortcuts(Cog):
                     await ctx.send(embed=embed)
                 embed = discord.Embed()
                 embed.title = "Shortcuts for this server"
+                embed.description = (
+                    f"Tip: You can append extra text when triggering a shortcut.\n"
+                    f"Example: `{settings.prefix}name your extra message here`"
+                )
             embed.add_field(name=settings.prefix + e.name, value=e.value[:1024])
 
         if embed.fields:
             await ctx.send(embed=embed)
 
     list.example_usage = """
-    `{prefix}shortcuts list - lists all shortcuts
+    `{prefix}shortcuts list` - lists all shortcuts
+    You can trigger any shortcut with optional extra text: `!name some extra context`
     """
 
     @Cog.listener()
@@ -144,13 +166,27 @@ class Shortcuts(Cog):
         if not c.startswith(setting.prefix):
             return
 
+        after_prefix = c[len(setting.prefix):]
+        if not after_prefix.strip():
+            return
+
+        # Split into command name and optional extra content
+        parts = after_prefix.split(None, 1)
+        cmd_name = parts[0]
+        extra = parts[1] if len(parts) > 1 else ""
+
         shortcuts = await ShortcutEntry.get_by(guild_id=msg.guild.id)
         if not shortcuts:
             return
 
         for shortcut in shortcuts:
-            if c.lower()[len(setting.prefix):] == shortcut.name.lower():
-                await msg.channel.send(shortcut.value)
+            if cmd_name.lower() == shortcut.name.lower():
+                response = shortcut.value
+                if extra:
+                    extra = self._sanitize_extra(extra)
+                    if extra:
+                        response = f"{response}\n{extra}"
+                await msg.channel.send(response)
                 return
 
 async def setup(bot):
