@@ -347,41 +347,68 @@ class News(Cog):
     async def list_subscriptions(self, ctx: DozerContext, channel: discord.TextChannel = None):
         """List all subscriptions that the current server are subscribed to"""
         if channel is not None:
-            results = await NewsSubscription.get_by(guild_id=ctx.guild.id, channel_id=ctx.channel.id)
+            results = await NewsSubscription.get_by(guild_id=ctx.guild.id, channel_id=channel.id)
         else:
             results = await NewsSubscription.get_by(guild_id=ctx.guild.id)
 
         if not results:
             embed = discord.Embed(title=f"News Subscriptions for {ctx.guild.name}")
-            embed.description = f"No news subscriptions found for this guild! Add one using `{self.bot.command_prefix}" \
-                                f"news add <channel> <source>`"
+            if channel is not None:
+                embed.description = (f"No news subscriptions found for {channel.mention}! Add one using "
+                                     f"`{self.bot.command_prefix}news add {channel.mention} <source>`")
+            else:
+                embed.description = (f"No news subscriptions found for this guild! Add one using "
+                                     f"`{self.bot.command_prefix}news add <channel> <source>`")
             embed.colour = discord.Color.red()
             await ctx.send(embed=embed)
             return
 
         channels = {}
+        missing_channels = []
         for result in results:
-            channel = ctx.bot.get_channel(result.channel_id)
-            if channel is None:
+            found_channel = ctx.bot.get_channel(result.channel_id)
+            if found_channel is None:
                 logger.error(f"Channel ID {result.channel_id} for subscription ID {result.id} not found.")
+                missing_channels.append(result)
                 continue
 
             try:
-                channels[channel].append(result)
+                channels[found_channel].append(result)
             except KeyError:
-                channels[channel] = [result]
+                channels[found_channel] = [result]
 
         embed = discord.Embed()
-        embed.title = f"News Subscriptions for {ctx.guild.name}"
+        if channel is not None:
+            embed.title = f"News Subscriptions for #{channel.name} in {ctx.guild.name}"
+        else:
+            embed.title = f"News Subscriptions for {ctx.guild.name}"
         embed.colour = discord.Color.dark_orange()
         for found_channel, lst in channels.items():
             subs = ""
             for sub in lst:
-                subs += f"{sub.source}"
+                # Resolve the human-readable source name when possible
+                source_obj = self.sources.get(sub.source)
+                if source_obj is not None:
+                    display_name = source_obj.full_name
+                else:
+                    display_name = f"{sub.source} *(source unavailable)*"
+                subs += f"{display_name}"
                 if sub.data:
                     subs += f": {sub.data}"
-                subs += "\n"
-            embed.add_field(name=f"#{found_channel.name}", value=subs)
+                subs += f" ({sub.kind})\n"
+            embed.add_field(name=f"#{found_channel.name}", value=subs, inline=False)
+
+        if missing_channels:
+            stale = ""
+            for sub in missing_channels:
+                source_obj = self.sources.get(sub.source)
+                display_name = source_obj.full_name if source_obj else sub.source
+                stale += f"• {display_name}"
+                if sub.data:
+                    stale += f": {sub.data}"
+                stale += f" (sub #{sub.id}, channel no longer exists)\n"
+            embed.add_field(name="⚠ Subscriptions for deleted channels",
+                            value=stale, inline=False)
         await ctx.send(embed=embed)
 
     list_subscriptions.example_usage = """`{prefix}news subs` - Check all subscriptions in the current server

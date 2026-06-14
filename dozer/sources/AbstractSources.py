@@ -14,7 +14,18 @@ class Source:
     disabled = False
 
     def __init__(self, aiohttp_session: aiohttp.ClientSession, bot):
-        self.aliases = (self.full_name, self.short_name)
+        # Preserve class-level aliases if the subclass defined custom ones
+        # (i.e., overrode the default empty tuple). Always include full_name
+        # and short_name so that both human-readable and short forms work.
+        class_aliases = type(self).__dict__.get('aliases', tuple())
+        if isinstance(class_aliases, str):
+            class_aliases = (class_aliases,)
+        base = {self.full_name, self.short_name}
+        all_aliases = list(base)
+        for alias in class_aliases:
+            if alias not in all_aliases:
+                all_aliases.append(alias)
+        self.aliases = tuple(all_aliases)
         self.http_session = aiohttp_session
         self.bot = bot
 
