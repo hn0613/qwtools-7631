@@ -347,13 +347,17 @@ class News(Cog):
     async def list_subscriptions(self, ctx: DozerContext, channel: discord.TextChannel = None):
         """List all subscriptions that the current server are subscribed to"""
         if channel is not None:
-            results = await NewsSubscription.get_by(guild_id=ctx.guild.id, channel_id=ctx.channel.id)
+            results = await NewsSubscription.get_by(guild_id=ctx.guild.id, channel_id=channel.id)
         else:
             results = await NewsSubscription.get_by(guild_id=ctx.guild.id)
 
         if not results:
-            embed = discord.Embed(title=f"News Subscriptions for {ctx.guild.name}")
-            embed.description = f"No news subscriptions found for this guild! Add one using `{self.bot.command_prefix}" \
+            if channel is not None:
+                title = f"News Subscriptions for #{channel.name}"
+            else:
+                title = f"News Subscriptions for {ctx.guild.name}"
+            embed = discord.Embed(title=title)
+            embed.description = f"No news subscriptions found! Add one using `{self.bot.command_prefix}" \
                                 f"news add <channel> <source>`"
             embed.colour = discord.Color.red()
             await ctx.send(embed=embed)
@@ -361,18 +365,21 @@ class News(Cog):
 
         channels = {}
         for result in results:
-            channel = ctx.bot.get_channel(result.channel_id)
-            if channel is None:
+            found_channel = ctx.bot.get_channel(result.channel_id)
+            if found_channel is None:
                 logger.error(f"Channel ID {result.channel_id} for subscription ID {result.id} not found.")
                 continue
 
             try:
-                channels[channel].append(result)
+                channels[found_channel].append(result)
             except KeyError:
-                channels[channel] = [result]
+                channels[found_channel] = [result]
 
         embed = discord.Embed()
-        embed.title = f"News Subscriptions for {ctx.guild.name}"
+        if channel is not None:
+            embed.title = f"News Subscriptions for #{channel.name}"
+        else:
+            embed.title = f"News Subscriptions for {ctx.guild.name}"
         embed.colour = discord.Color.dark_orange()
         for found_channel, lst in channels.items():
             subs = ""
@@ -380,6 +387,7 @@ class News(Cog):
                 subs += f"{sub.source}"
                 if sub.data:
                     subs += f": {sub.data}"
+                subs += f" [{sub.kind}]"
                 subs += "\n"
             embed.add_field(name=f"#{found_channel.name}", value=subs)
         await ctx.send(embed=embed)

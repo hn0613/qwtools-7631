@@ -14,7 +14,10 @@ class Source:
     disabled = False
 
     def __init__(self, aiohttp_session: aiohttp.ClientSession, bot):
-        self.aliases = (self.full_name, self.short_name)
+        cls_aliases = type(self).aliases
+        if isinstance(cls_aliases, str):
+            cls_aliases = (cls_aliases,)
+        self.aliases = tuple(dict.fromkeys((self.full_name, self.short_name) + tuple(cls_aliases)))
         self.http_session = aiohttp_session
         self.bot = bot
 
