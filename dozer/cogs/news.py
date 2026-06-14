@@ -71,6 +71,8 @@ class News(Cog):
             #   }
             # }
             for sub in subs:
+                if sub.paused:
+                    continue
                 channel = self.bot.get_channel(sub.channel_id)
                 if channel is None:
                     logger.error(f"Channel {sub.channel_id} (sub ID {sub.id}) returned None. Not removing this"
@@ -166,6 +168,9 @@ class News(Cog):
                         value=f"To remove a source, like Chief Delphi, use `{ctx.prefix}news remove #channel cd`")
         embed.add_field(name="List all sources",
                         value=f"To see all sources, use `{ctx.prefix}news sources`")
+        embed.add_field(name="Pausing & Resuming",
+                        value=f"To pause a source without removing it, use `{ctx.prefix}news pause #channel source`. "
+                              f"To resume, use `{ctx.prefix}news resume #channel source`")
         embed.add_field(name="List all subscriptions",
                         value=f"To see all of your server's subscriptions, use `{ctx.prefix}news "
                               f"subscriptions`")
@@ -324,6 +329,80 @@ class News(Cog):
     remove.example_usage = """`{prefix}news remove #news cd` - Remove the subscription of Chief Delphi to #news
      `{prefix}news remove #reddit reddit frc` - Remove the subscription of /r/FRC to #reddit"""
 
+    async def _find_subscription(self, ctx: DozerContext, channel: discord.TextChannel, source: Source, data=None):
+        """Locate a single subscription, handling DataBasedSource data cleaning and error cases."""
+        if isinstance(source, DataBasedSource):
+            if data is None:
+                raise BadArgument(f"The source {source.full_name} needs data.")
+            try:
+                data_obj = await source.clean_data(data)
+            except DataBasedSource.InvalidDataException as e:
+                raise BadArgument(f"Data {data} is invalid. {e.args[0]}")
+
+            subs = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                  source=source.short_name, data=str(data_obj))
+        else:
+            subs = await NewsSubscription.get_by(channel_id=channel.id, guild_id=channel.guild.id,
+                                                  source=source.short_name)
+
+        if len(subs) == 0:
+            data_msg = f" with data {data}" if data else ""
+            raise BadArgument(f"No subscription of {source.full_name} for {channel.mention}{data_msg} found.")
+
+        if len(subs) > 1:
+            raise BadArgument(f"Multiple subscriptions of {source.full_name} for {channel.mention} found. "
+                              f"Please contact the Dozer administrators.")
+
+        return subs[0]
+
+    @news.command()
+    @has_permissions(manage_guild=True)
+    @guild_only()
+    async def pause(self, ctx: DozerContext, channel: discord.TextChannel, source: Source, data=None):
+        """Pause a subscription without removing it. Paused subscriptions will not receive new posts."""
+        sub = await self._find_subscription(ctx, channel, source, data)
+
+        if sub.paused:
+            raise BadArgument(f"The subscription of {source.full_name} in {channel.mention} is already paused.")
+
+        sub.paused = True
+        await sub.update_or_add()
+
+        embed = discord.Embed(title=f"Subscription paused",
+                              description=f"{source.full_name} in #{channel.name} has been paused. "
+                                          f"Use `{ctx.prefix}news resume` to resume.")
+        if isinstance(source, DataBasedSource) and sub.data:
+            embed.add_field(name="Data", value=sub.data)
+        embed.colour = discord.Color.orange()
+        await ctx.send(embed=embed)
+
+    pause.example_usage = """`{prefix}news pause #news cd` - Pause Chief Delphi posts in #news
+    `{prefix}news pause #reddit reddit frc` - Pause /r/FRC posts in #reddit"""
+
+    @news.command()
+    @has_permissions(manage_guild=True)
+    @guild_only()
+    async def resume(self, ctx: DozerContext, channel: discord.TextChannel, source: Source, data=None):
+        """Resume a paused subscription. Posts will be delivered again."""
+        sub = await self._find_subscription(ctx, channel, source, data)
+
+        if not sub.paused:
+            raise BadArgument(f"The subscription of {source.full_name} in {channel.mention} is not paused.")
+
+        sub.paused = False
+        await sub.update_or_add()
+
+        embed = discord.Embed(title=f"Subscription resumed",
+                              description=f"{source.full_name} in #{channel.name} has been resumed. "
+                                          f"New posts will appear again.")
+        if isinstance(source, DataBasedSource) and sub.data:
+            embed.add_field(name="Data", value=sub.data)
+        embed.colour = discord.Color.green()
+        await ctx.send(embed=embed)
+
+    resume.example_usage = """`{prefix}news resume #news cd` - Resume Chief Delphi posts in #news
+    `{prefix}news resume #reddit reddit frc` - Resume /r/FRC posts in #reddit"""
+
     @news.command(name='sources')
     async def list_sources(self, ctx: DozerContext):
         """List all available sources to subscribe to."""
@@ -380,6 +459,8 @@ class News(Cog):
                 subs += f"{sub.source}"
                 if sub.data:
                     subs += f": {sub.data}"
+                if sub.paused:
+                    subs += " (PAUSED)"
                 subs += "\n"
             embed.add_field(name=f"#{found_channel.name}", value=subs)
         await ctx.send(embed=embed)
@@ -454,10 +535,12 @@ class NewsSubscription(db.DatabaseTable):
             guild_id bigint NOT NULL,
             source varchar NOT NULL,
             data varchar,
-            kind varchar NOT NULL
+            kind varchar NOT NULL,
+            paused bool NOT NULL DEFAULT false
             )""")
 
-    def __init__(self, channel_id: int, guild_id: int, source: str, kind: str, data: str = None, sub_id: int = None):
+    def __init__(self, channel_id: int, guild_id: int, source: str, kind: str, data: str = None, sub_id: int = None,
+                 paused: bool = False):
         super().__init__()
         self.id = sub_id
         self.channel_id = channel_id
@@ -465,6 +548,7 @@ class NewsSubscription(db.DatabaseTable):
         self.source = source
         self.kind = kind
         self.data = data
+        self.paused = paused
 
     @classmethod
     async def get_by(cls, **kwargs):
@@ -473,6 +557,16 @@ class NewsSubscription(db.DatabaseTable):
         for result in results:
             obj = NewsSubscription(sub_id=result.get("id"), channel_id=result.get("channel_id"),
                                    guild_id=result.get("guild_id"), source=result.get("source"),
-                                   kind=result.get("kind"), data=result.get("data"))
+                                   kind=result.get("kind"), data=result.get("data"),
+                                   paused=result.get("paused", False))
             result_list.append(obj)
         return result_list
+
+    async def version_1(self):
+        """DB migration v1 - add paused field"""
+        async with db.Pool.acquire() as conn:
+            await conn.execute(f"""
+            ALTER TABLE {self.__tablename__} ADD paused bool NOT NULL DEFAULT false;
+            """)
+
+    __versions__ = [version_1]
