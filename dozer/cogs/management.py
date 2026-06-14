@@ -31,7 +31,15 @@ class Management(Cog):
         if os.path.isfile(TIMEZONE_FILE):
             logger.info("Loaded timezone configurations")
             with open(TIMEZONE_FILE) as f:
-                self.timezones = json.load(f)
+                raw_tz = json.load(f)
+            self.timezones = {}
+            for abbr, utc_str in raw_tz.items():
+                try:
+                    offset_str = utc_str.replace("UTC", "").strip()
+                    offset_hours = int(offset_str) if offset_str else 0
+                    self.timezones[abbr] = offset_hours * 3600
+                except (ValueError, AttributeError):
+                    logger.warning(f"Invalid timezone entry: {abbr}={utc_str}, skipping")
         else:
             logger.error("Unable to load timezone configurations")
             self.timezones = {}
@@ -53,11 +61,21 @@ class Management(Cog):
 
     async def msg_timer(self, db_entry):
         """Holds the futures for sending a message"""
-        delay = db_entry.time - datetime.now(tz=timezone.utc)
-        if delay.total_seconds() > 0:
-            await asyncio.sleep(delay.total_seconds())
-        await self.send_scheduled_msg(db_entry)
-        await db_entry.delete(request_id=db_entry.request_id)
+        try:
+            delay = db_entry.time - datetime.now(tz=timezone.utc)
+            if delay.total_seconds() > 0:
+                await asyncio.sleep(delay.total_seconds())
+            await self.send_scheduled_msg(db_entry)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error(f"Error sending scheduled message {db_entry.entry_id}: {e}")
+        finally:
+            try:
+                await db_entry.delete(request_id=db_entry.request_id)
+            except Exception as e:
+                logger.error(f"Error deleting scheduled message {db_entry.entry_id} from DB: {e}")
+            self.timers.pop(db_entry.request_id, None)
 
     async def send_scheduled_msg(self, db_entry, channel_override: int = None):
         """Formats and sends scheduled message"""
@@ -76,8 +94,11 @@ class Management(Cog):
         embed.colour = blurple
         perms = channel.permissions_for(guild.me)
         if db_entry.requester_id:
-            name = await guild.fetch_member(db_entry.requester_id)
-            embed.set_footer(text=f"Author: {escape_markdown(name.display_name)}")
+            try:
+                member = await guild.fetch_member(db_entry.requester_id)
+                embed.set_footer(text=f"Author: {escape_markdown(member.display_name)}")
+            except (discord.NotFound, discord.HTTPException):
+                embed.set_footer(text=f"Author: Unknown (ID: {db_entry.requester_id})")
         if perms.send_messages:
             await channel.send(embed=embed)
         else:
@@ -109,19 +130,23 @@ class Management(Cog):
             raise BadArgument("Date exceeds max value")
         if send_time.tzinfo is None:
             await ctx.send("```Warning! Unknown timezone entered, defaulting to UTC```")
-            send_time.replace(tzinfo=timezone.utc)
+            send_time = send_time.replace(tzinfo=timezone.utc)
         content = content.split("-/-", 1)
         message = content[1] if len(content) == 2 else content[0]
         header = content[0] if len(content) == 2 else None
-        if header is not None:
-            if len(header) > 256:  # message does not need a check as description max char is higher than max message length of 4000
-                await ctx.send("```Warning! Header larger than max 256 characters, header has been truncated```")
+        if header is not None and len(header) > 256:
+            await ctx.send("```Warning! Header larger than max 256 characters, header has been truncated```")
+            header = header[:256]
+        if len(message) > 4096:
+            raise BadArgument("Message content exceeds the maximum length of 4096 characters")
+        if send_time <= datetime.now(tz=timezone.utc):
+            raise BadArgument("Cannot schedule a message in the past. Please provide a future date/time.")
         entry = ScheduledMessages(
             guild_id=ctx.guild.id,
             channel_id=channel.id,
             time=send_time,
             content=message,
-            header=header[:256],
+            header=header,
             requester_id=ctx.author.id,
             request_id=ctx.message.id
         )
@@ -142,12 +167,13 @@ class Management(Cog):
     @has_permissions(manage_messages=True)
     async def delete(self, ctx: DozerContext, entry_id: int):
         """Delete a scheduled message"""
-        entries = await ScheduledMessages.get_by(entry_id=entry_id)
+        entries = await ScheduledMessages.get_by(entry_id=entry_id, guild_id=ctx.guild.id)
         e = discord.Embed(color=blurple)
         if len(entries) > 0:
             response = await ScheduledMessages.delete(request_id=entries[0].request_id)
-            task = self.timers.pop(entries[0].request_id)
-            task.cancel()
+            task = self.timers.pop(entries[0].request_id, None)
+            if task is not None:
+                task.cancel()
             if response.split(" ", 1)[1] == "1":
                 e.add_field(name='Success', value=f"Deleted entry with ID: {entry_id} and cancelled planned send")
                 e.set_footer(text='Triggered by ' + escape_markdown(ctx.author.display_name))
@@ -156,7 +182,7 @@ class Management(Cog):
                 raise InterruptedError("Requested row not deleted")
 
         else:
-            e.add_field(name='Error', value=f"No entry with ID: {entry_id} found")
+            e.add_field(name='Error', value=f"No entry with ID: {entry_id} found in this server")
             e.set_footer(text='Triggered by ' + escape_markdown(ctx.author.display_name))
             await ctx.send(embed=e)
 
@@ -169,16 +195,29 @@ class Management(Cog):
     async def list(self, ctx: DozerContext):
         """Displays currently scheduled messages"""
         messages = await ScheduledMessages.get_by(guild_id=ctx.guild.id)
+        if not messages:
+            embed = discord.Embed(title=f"Currently scheduled messages for {ctx.guild}",
+                                  description="No scheduled messages found.", color=blurple)
+            await ctx.send(embed=embed)
+            return
         pages = []
         for page_num, page in enumerate(chunk(messages, 3)):
-            embed = discord.Embed(title=f"Currently scheduled messages for {ctx.guild}")
+            embed = discord.Embed(title=f"Currently scheduled messages for {ctx.guild}", color=blurple)
             pages.append(embed)
             for message in page:
-                requester = await ctx.guild.fetch_member(message.requester_id)
+                try:
+                    requester = await ctx.guild.fetch_member(message.requester_id)
+                    author_display = requester.mention
+                except (discord.NotFound, discord.HTTPException):
+                    author_display = f"Unknown (ID: {message.requester_id})"
+                time_str = message.time.strftime('%B %d %H:%M%z %Y')
                 embed.add_field(name=f"ID: {message.entry_id}", value=f"Channel: <#{message.channel_id}>"
-                                                                      f"\nTime: {message.time} UTC"
-                                                                      f"\nAuthor: {requester.mention}", inline=False)
-                embed.add_field(name=f"Header: {message.header}", value=message.content, inline=False)
+                                                                      f"\nTime: {time_str}"
+                                                                      f"\nAuthor: {author_display}", inline=False)
+                if message.header:
+                    embed.add_field(name=f"Header: {message.header}", value=message.content, inline=False)
+                else:
+                    embed.add_field(name="Content", value=message.content, inline=False)
                 embed.set_footer(text=f"Page {page_num + 1} of {math.ceil(len(messages) / 3)}")
         await paginate(ctx, pages)
 
